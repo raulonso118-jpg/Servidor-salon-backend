@@ -17,7 +17,7 @@ from pagos_mp import crear_preferencia, obtener_pago, extraer_data_pago
 PORT = int(os.environ.get("PORT", 8080))
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
-# Idempotencia en memoria (evita duplicar licencia por mismo pago en una instancia)
+# Evita duplicar licencias si llega más de una notificación del mismo pago
 PAGOS_PROCESADOS = {}
 
 init_db()
@@ -36,7 +36,7 @@ def respuesta(handler, payload, status=200):
 
 
 def licencia_autorizada(handler, datos):
-    ok, mensaje, dias = validar_licencia_completa(
+    ok, mensaje, _dias = validar_licencia_completa(
         datos.get("licencia", ""),
         api_key=datos.get("api_key"),
         token=datos.get("token"),
@@ -65,6 +65,7 @@ def procesar_rostro(img, datos):
     brillo = float(datos.get("brillo", 100)) / 100.0
     contraste = float(datos.get("contraste", 100)) / 100.0
     arr = (arr - 128.0) * contraste + 128.0 + ((brillo - 1.0) * 50.0)
+
     modo = datos.get("modo_color", "normal")
     if modo == "gris":
         gris = np.mean(arr, axis=2, keepdims=True)
@@ -72,6 +73,7 @@ def procesar_rostro(img, datos):
     elif modo == "rosa":
         arr[:, :, 0] *= 1.25
         arr[:, :, 1] *= 0.85
+
     result = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
     suavizado = float(datos.get("suavizado", 0))
     return result.filter(ImageFilter.GaussianBlur((suavizado / 100.0) * 3.0)) if suavizado > 0 else result
@@ -86,13 +88,14 @@ def editar_rasgos(img, datos):
     x = max(0, min(w - 1, int(datos.get("coord_x", w // 2))))
     y = max(0, min(h - 1, int(datos.get("coord_y", h // 2))))
     zona = str(datos.get("zona", "Labios")).lower()
-    factor = {"cabello": .18, "labio": .06, "sombra": .05, "rubor": .08}.get(
-        next((k for k in ("cabello", "labio", "sombra", "rubor") if k in zona), "rubor"), .08
+    factor = {"cabello": 0.18, "labio": 0.06, "sombra": 0.05, "rubor": 0.08}.get(
+        next((k for k in ("cabello", "labio", "sombra", "rubor") if k in zona), "rubor"),
+        0.08,
     )
     radio = max(1, int(w * factor))
     mask = Image.new("L", (w, h), 0)
     ImageDraw.Draw(mask).ellipse((x - radio, y - radio, x + radio, y + radio), fill=255)
-    mask = mask.filter(ImageFilter.GaussianBlur(max(1, int(radio * .5))))
+    mask = mask.filter(ImageFilter.GaussianBlur(max(1, int(radio * 0.5))))
     overlay = Image.new("RGB", (w, h), rgb)
     alpha = max(0.0, min(1.0, float(datos.get("intensidad", 60)) / 100.0))
     mask = mask.point(lambda value: int(value * alpha))
@@ -127,6 +130,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
             datos = json.loads(self.rfile.read(length).decode("utf-8"))
 
+            # Validación de licencia
             if self.path == "/api/validar_licencia":
                 ok, mensaje, dias = validar_licencia_completa(
                     datos.get("licencia", ""),
@@ -135,9 +139,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     datos.get("device_id"),
                     self.client_address[0],
                 )
-                respuesta(self, {"estatus": "ok" if ok else "error", "mensaje": mensaje, "dias_restantes": dias}, 200 if ok else 403)
+                respuesta(
+                    self,
+                    {"estatus": "ok" if ok else "error", "mensaje": mensaje, "dias_restantes": dias},
+                    200 if ok else 403,
+                )
                 return
 
+            # Crear preferencia de pago
             if self.path == "/api/pagos/crear_preferencia":
                 email = datos.get("email", "")
                 plan = datos.get("plan", "")
@@ -145,6 +154,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 respuesta(self, {"estatus": "ok", **pref}, 200)
                 return
 
+            # Webhook Mercado Pago
             if self.path == "/api/pagos/webhook":
                 tipo = datos.get("type") or datos.get("topic")
                 data = datos.get("data") or {}
@@ -154,6 +164,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     respuesta(self, {"estatus": "ok", "mensaje": "Evento ignorado"}, 200)
                     return
 
+                # idempotencia básica
                 if payment_id in PAGOS_PROCESADOS:
                     respuesta(self, {"estatus": "ok", "mensaje": "Pago ya procesado"}, 200)
                     return
@@ -195,6 +206,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
 
+            # Consulta estado de orden/pago
             if self.path == "/api/pagos/estado_orden":
                 payment_id = str(datos.get("payment_id", "")).strip()
                 if not payment_id:
@@ -210,12 +222,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 respuesta(self, {"estatus": "ok", "procesado": False, "pago": pago}, 200)
                 return
 
+            # Endpoints de imagen protegidos por licencia
             if self.path in ("/api/procesar_rostro", "/api/editar_rasgos"):
                 if not licencia_autorizada(self, datos):
                     return
                 img = cargar_imagen(datos, "imagen_base64", "imagen", "imagen_procesada")
                 result = procesar_rostro(img, datos) if self.path.endswith("rostro") else editar_rasgos(img, datos)
-                respuesta(self, {"estatus": "ok", "imagen_procesada": imagen_base64(result), "imagen_resultante": imagen_base64(result)})
+                respuesta(
+                    self,
+                    {
+                        "estatus": "ok",
+                        "imagen_procesada": imagen_base64(result),
+                        "imagen_resultante": imagen_base64(result),
+                    },
+                )
                 return
 
             respuesta(self, {"estatus": "error", "mensaje": "Endpoint no existe"}, 404)
