@@ -1,4 +1,4 @@
-"""Servidor HTTP del backend NBO-A con validación de licencias."""
+"""Servidor HTTP del backend NBO-A con validación de licencias y pagos MP."""
 import base64
 import datetime
 import http.server
@@ -11,10 +11,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 
 from db_manager import init_db
-from validador_licencias import validar_licencia_completa
+from validador_licencias import validar_licencia_completa, generar_licencia_real
+from pagos_mp import crear_preferencia, obtener_pago, extraer_data_pago
 
 PORT = int(os.environ.get("PORT", 8080))
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+# Idempotencia en memoria (evita duplicar licencia por mismo pago en una instancia)
+PAGOS_PROCESADOS = {}
+
 init_db()
 
 
@@ -81,10 +86,12 @@ def editar_rasgos(img, datos):
     x = max(0, min(w - 1, int(datos.get("coord_x", w // 2))))
     y = max(0, min(h - 1, int(datos.get("coord_y", h // 2))))
     zona = str(datos.get("zona", "Labios")).lower()
-    factor = {"cabello": .18, "labio": .06, "sombra": .05, "rubor": .08}.get(next((k for k in ("cabello", "labio", "sombra", "rubor") if k in zona), "rubor"), .08)
+    factor = {"cabello": .18, "labio": .06, "sombra": .05, "rubor": .08}.get(
+        next((k for k in ("cabello", "labio", "sombra", "rubor") if k in zona), "rubor"), .08
+    )
     radio = max(1, int(w * factor))
     mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).ellipse((x-radio, y-radio, x+radio, y+radio), fill=255)
+    ImageDraw.Draw(mask).ellipse((x - radio, y - radio, x + radio, y + radio), fill=255)
     mask = mask.filter(ImageFilter.GaussianBlur(max(1, int(radio * .5))))
     overlay = Image.new("RGB", (w, h), rgb)
     alpha = max(0.0, min(1.0, float(datos.get("intensidad", 60)) / 100.0))
@@ -117,11 +124,92 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if length <= 0 or length > 15 * 1024 * 1024:
                 respuesta(self, {"estatus": "error", "mensaje": "Solicitud vacía o demasiado grande"}, 400)
                 return
+
             datos = json.loads(self.rfile.read(length).decode("utf-8"))
+
             if self.path == "/api/validar_licencia":
-                ok, mensaje, dias = validar_licencia_completa(datos.get("licencia", ""), datos.get("api_key"), datos.get("token"), datos.get("device_id"), self.client_address[0])
+                ok, mensaje, dias = validar_licencia_completa(
+                    datos.get("licencia", ""),
+                    datos.get("api_key"),
+                    datos.get("token"),
+                    datos.get("device_id"),
+                    self.client_address[0],
+                )
                 respuesta(self, {"estatus": "ok" if ok else "error", "mensaje": mensaje, "dias_restantes": dias}, 200 if ok else 403)
                 return
+
+            if self.path == "/api/pagos/crear_preferencia":
+                email = datos.get("email", "")
+                plan = datos.get("plan", "")
+                pref = crear_preferencia(email=email, plan=plan)
+                respuesta(self, {"estatus": "ok", **pref}, 200)
+                return
+
+            if self.path == "/api/pagos/webhook":
+                tipo = datos.get("type") or datos.get("topic")
+                data = datos.get("data") or {}
+                payment_id = str(data.get("id") or datos.get("id") or "")
+
+                if tipo != "payment" or not payment_id:
+                    respuesta(self, {"estatus": "ok", "mensaje": "Evento ignorado"}, 200)
+                    return
+
+                if payment_id in PAGOS_PROCESADOS:
+                    respuesta(self, {"estatus": "ok", "mensaje": "Pago ya procesado"}, 200)
+                    return
+
+                pago_json = obtener_pago(payment_id)
+                pago = extraer_data_pago(pago_json)
+
+                if pago["status"] != "approved":
+                    respuesta(self, {"estatus": "ok", "mensaje": f"Pago no aprobado ({pago['status']})"}, 200)
+                    return
+
+                email = pago.get("email") or "cliente@salon.com"
+                dias = int(pago.get("dias", 30))
+
+                licencia = generar_licencia_real(dias=dias, email=email, device_id=None)
+                if licencia.get("estatus") != "ok":
+                    respuesta(self, {"estatus": "error", "mensaje": "No se pudo generar licencia"}, 500)
+                    return
+
+                PAGOS_PROCESADOS[payment_id] = {
+                    "licencia": licencia["codigo"],
+                    "email": email,
+                    "plan": pago.get("plan"),
+                    "dias": dias,
+                    "fecha": datetime.datetime.now().isoformat(),
+                }
+
+                respuesta(
+                    self,
+                    {
+                        "estatus": "ok",
+                        "mensaje": "Pago aprobado y licencia generada",
+                        "payment_id": payment_id,
+                        "licencia": licencia["codigo"],
+                        "email": email,
+                        "dias": dias,
+                    },
+                    200,
+                )
+                return
+
+            if self.path == "/api/pagos/estado_orden":
+                payment_id = str(datos.get("payment_id", "")).strip()
+                if not payment_id:
+                    respuesta(self, {"estatus": "error", "mensaje": "Falta payment_id"}, 400)
+                    return
+
+                if payment_id in PAGOS_PROCESADOS:
+                    respuesta(self, {"estatus": "ok", "procesado": True, **PAGOS_PROCESADOS[payment_id]}, 200)
+                    return
+
+                pago_json = obtener_pago(payment_id)
+                pago = extraer_data_pago(pago_json)
+                respuesta(self, {"estatus": "ok", "procesado": False, "pago": pago}, 200)
+                return
+
             if self.path in ("/api/procesar_rostro", "/api/editar_rasgos"):
                 if not licencia_autorizada(self, datos):
                     return
@@ -129,7 +217,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = procesar_rostro(img, datos) if self.path.endswith("rostro") else editar_rasgos(img, datos)
                 respuesta(self, {"estatus": "ok", "imagen_procesada": imagen_base64(result), "imagen_resultante": imagen_base64(result)})
                 return
+
             respuesta(self, {"estatus": "error", "mensaje": "Endpoint no existe"}, 404)
+
         except (ValueError, json.JSONDecodeError, base64.binascii.Error) as error:
             respuesta(self, {"estatus": "error", "mensaje": str(error)}, 400)
         except Exception as error:
