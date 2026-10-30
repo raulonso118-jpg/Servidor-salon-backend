@@ -1,11 +1,16 @@
 """Servidor HTTP del backend NBO-A con validación de licencias y pagos MP."""
 import base64
 import datetime
+import hashlib
+import hmac
+import html
 import http.server
 import io
 import json
 import os
 import socketserver
+import threading
+from urllib.parse import parse_qs, urlparse
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
@@ -13,14 +18,84 @@ from PIL import Image, ImageDraw, ImageFilter
 from db_manager import init_db
 from validador_licencias import validar_licencia_completa, generar_licencia_real
 from pagos_mp import crear_preferencia, obtener_pago, extraer_data_pago
+from pagos_db import init_pagos_db, obtener_pago_guardado, guardar_pago
 
 PORT = int(os.environ.get("PORT", 8080))
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
-# Evita duplicar licencias si llega más de una notificación del mismo pago
-PAGOS_PROCESADOS = {}
+# Evita generar dos licencias si llegan notificaciones simultáneas del mismo pago
+PAGOS_LOCK = threading.Lock()
 
 init_db()
+init_pagos_db()
+
+
+def procesar_pago(payment_id, external_reference=None):
+    """Consulta el pago en Mercado Pago y, si está aprobado, genera la licencia una sola vez."""
+    with PAGOS_LOCK:
+        guardado = obtener_pago_guardado(payment_id)
+        if guardado:
+            if external_reference and guardado["external_reference"] != external_reference:
+                raise ValueError("La referencia no coincide con el pago")
+            return {"status": "approved", "procesado": True, **guardado}
+
+        pago = extraer_data_pago(obtener_pago(payment_id))
+        if external_reference and pago["external_reference"] != external_reference:
+            raise ValueError("La referencia no coincide con el pago")
+        if pago["status"] != "approved":
+            return {"status": pago["status"], "procesado": False}
+        if not str(pago.get("external_reference") or "").startswith("orden_"):
+            raise ValueError("El pago no pertenece a una orden de licencia")
+
+        email = pago.get("email") or "cliente@salon.com"
+        dias = int(pago["dias"])
+        licencia = generar_licencia_real(dias=dias, email=email, device_id=None)
+        if licencia.get("estatus") != "ok":
+            raise RuntimeError("No se pudo generar la licencia")
+
+        guardar_pago(payment_id, pago["external_reference"], email, pago["plan"], dias, licencia["codigo"])
+        return {
+            "status": "approved",
+            "procesado": True,
+            "payment_id": str(payment_id),
+            "external_reference": pago["external_reference"],
+            "email": email,
+            "plan": pago["plan"],
+            "dias": dias,
+            "licencia": licencia["codigo"],
+        }
+
+
+def firma_webhook_valida(headers, data_id):
+    """Si MP envía x-signature y hay MP_WEBHOOK_SECRET, la firma debe ser válida."""
+    secret = os.environ.get("MP_WEBHOOK_SECRET", "").strip()
+    firma = headers.get("x-signature", "")
+    if not secret or not firma:
+        return True
+    partes = {}
+    for parte in firma.split(","):
+        if "=" in parte:
+            k, v = parte.split("=", 1)
+            partes[k.strip()] = v.strip()
+    manifest = f"id:{str(data_id).lower()};request-id:{headers.get('x-request-id', '')};ts:{partes.get('ts', '')};"
+    esperado = hmac.new(secret.encode(), manifest.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(esperado, partes.get("v1", ""))
+
+
+def pagina_html(titulo, mensaje, licencia=None):
+    bloque = ""
+    if licencia:
+        bloque = (
+            "<p>Tu licencia (guárdala):</p>"
+            f"<p style='font-size:24px;font-weight:bold;word-break:break-all'>{html.escape(licencia)}</p>"
+        )
+    return (
+        "<!doctype html><html lang='es'><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{html.escape(titulo)}</title></head>"
+        "<body style='font-family:sans-serif;max-width:480px;margin:40px auto;padding:0 16px'>"
+        f"<h1>{html.escape(titulo)}</h1><p>{html.escape(mensaje)}</p>{bloque}</body></html>"
+    ).encode("utf-8")
 
 
 def respuesta(handler, payload, status=200):
@@ -33,6 +108,14 @@ def respuesta(handler, payload, status=200):
     handler.send_header("Access-Control-Allow-Headers", "Content-Type")
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def respuesta_html(handler, contenido, status=200):
+    handler.send_response(status)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(contenido)))
+    handler.end_headers()
+    handler.wfile.write(contenido)
 
 
 def licencia_autorizada(handler, datos):
@@ -116,22 +199,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
         respuesta(self, {}, 204)
 
     def do_GET(self):
-        if self.path in ("/", "/health"):
+        url = urlparse(self.path)
+        query = parse_qs(url.query)
+        if url.path in ("/", "/health"):
             respuesta(self, {"estatus": "ok", "motor": "NBO-A Genesis B"})
+        elif url.path == "/pago-exito":
+            payment_id = (query.get("payment_id") or query.get("collection_id") or [""])[0]
+            referencia = (query.get("external_reference") or [""])[0]
+            if not payment_id or not referencia:
+                respuesta_html(self, pagina_html("Pago", "Faltan datos del pago."), 400)
+                return
+            try:
+                res = procesar_pago(payment_id, referencia)
+            except Exception as error:
+                print(f"Error en pago-exito: {error}")
+                respuesta_html(self, pagina_html("Pago", "No pudimos confirmar tu pago. Escríbenos con tu comprobante."), 500)
+                return
+            if res.get("licencia"):
+                respuesta_html(self, pagina_html("¡Pago aprobado!", "Gracias por tu compra. Ingresa esta licencia en la app.", res["licencia"]))
+            else:
+                respuesta_html(self, pagina_html("Pago en proceso", "Tu pago aún no está aprobado. Recarga esta página en unos minutos."))
+        elif url.path == "/pago-pendiente":
+            respuesta_html(self, pagina_html("Pago pendiente", "Cuando se acredite tu pago recibirás tu licencia. Si ya pagaste, guarda tu comprobante."))
+        elif url.path == "/pago-fallo":
+            respuesta_html(self, pagina_html("Pago no completado", "No se realizó el cobro. Puedes intentarlo de nuevo."))
         else:
             respuesta(self, {"estatus": "error", "mensaje": "Ruta no encontrada"}, 404)
 
     def do_POST(self):
         try:
+            url = urlparse(self.path)
+            ruta = url.path
+            query = parse_qs(url.query)
             length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 15 * 1024 * 1024:
+            es_webhook = ruta == "/api/pagos/webhook"
+            if length > 15 * 1024 * 1024 or (length <= 0 and not es_webhook):
                 respuesta(self, {"estatus": "error", "mensaje": "Solicitud vacía o demasiado grande"}, 400)
                 return
 
-            datos = json.loads(self.rfile.read(length).decode("utf-8"))
+            raw = self.rfile.read(length).decode("utf-8") if length > 0 else ""
+            datos = json.loads(raw) if raw.strip() else {}
+            if not isinstance(datos, dict):
+                raise ValueError("JSON inválido")
 
             # Validación de licencia
-            if self.path == "/api/validar_licencia":
+            if ruta == "/api/validar_licencia":
                 ok, mensaje, dias = validar_licencia_completa(
                     datos.get("licencia", ""),
                     datos.get("api_key"),
@@ -147,87 +259,52 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
 
             # Crear preferencia de pago
-            if self.path == "/api/pagos/crear_preferencia":
+            if ruta == "/api/pagos/crear_preferencia":
                 email = datos.get("email", "")
                 plan = datos.get("plan", "")
                 pref = crear_preferencia(email=email, plan=plan)
                 respuesta(self, {"estatus": "ok", **pref}, 200)
                 return
 
-            # Webhook Mercado Pago
-            if self.path == "/api/pagos/webhook":
-                tipo = datos.get("type") or datos.get("topic")
+            # Webhook Mercado Pago (formato webhooks con query o body, y formato legacy topic/id)
+            if es_webhook:
+                tipo = (query.get("type") or query.get("topic") or [None])[0] or datos.get("type") or datos.get("topic")
                 data = datos.get("data") or {}
-                payment_id = str(data.get("id") or datos.get("id") or "")
+                payment_id = str((query.get("data.id") or query.get("id") or [None])[0] or data.get("id") or datos.get("id") or "")
 
                 if tipo != "payment" or not payment_id:
                     respuesta(self, {"estatus": "ok", "mensaje": "Evento ignorado"}, 200)
                     return
 
-                # idempotencia básica
-                if payment_id in PAGOS_PROCESADOS:
-                    respuesta(self, {"estatus": "ok", "mensaje": "Pago ya procesado"}, 200)
+                if not firma_webhook_valida(self.headers, payment_id):
+                    respuesta(self, {"estatus": "error", "mensaje": "Firma inválida"}, 401)
                     return
 
-                pago_json = obtener_pago(payment_id)
-                pago = extraer_data_pago(pago_json)
-
-                if pago["status"] != "approved":
-                    respuesta(self, {"estatus": "ok", "mensaje": f"Pago no aprobado ({pago['status']})"}, 200)
+                res = procesar_pago(payment_id)
+                if not res.get("licencia"):
+                    respuesta(self, {"estatus": "ok", "mensaje": f"Pago no aprobado ({res['status']})"}, 200)
                     return
-
-                email = pago.get("email") or "cliente@salon.com"
-                dias = int(pago.get("dias", 30))
-
-                licencia = generar_licencia_real(dias=dias, email=email, device_id=None)
-                if licencia.get("estatus") != "ok":
-                    respuesta(self, {"estatus": "error", "mensaje": "No se pudo generar licencia"}, 500)
-                    return
-
-                PAGOS_PROCESADOS[payment_id] = {
-                    "licencia": licencia["codigo"],
-                    "email": email,
-                    "plan": pago.get("plan"),
-                    "dias": dias,
-                    "fecha": datetime.datetime.now().isoformat(),
-                }
-
-                respuesta(
-                    self,
-                    {
-                        "estatus": "ok",
-                        "mensaje": "Pago aprobado y licencia generada",
-                        "payment_id": payment_id,
-                        "licencia": licencia["codigo"],
-                        "email": email,
-                        "dias": dias,
-                    },
-                    200,
-                )
+                print(f"Pago {payment_id} aprobado, licencia generada")
+                respuesta(self, {"estatus": "ok", "mensaje": "Pago aprobado y licencia generada", "payment_id": payment_id}, 200)
                 return
 
-            # Consulta estado de orden/pago
-            if self.path == "/api/pagos/estado_orden":
+            # Consulta estado de orden/pago (requiere payment_id y external_reference)
+            if ruta == "/api/pagos/estado_orden":
                 payment_id = str(datos.get("payment_id", "")).strip()
-                if not payment_id:
-                    respuesta(self, {"estatus": "error", "mensaje": "Falta payment_id"}, 400)
+                referencia = str(datos.get("external_reference", "")).strip()
+                if not payment_id or not referencia:
+                    respuesta(self, {"estatus": "error", "mensaje": "Faltan payment_id y external_reference"}, 400)
                     return
-
-                if payment_id in PAGOS_PROCESADOS:
-                    respuesta(self, {"estatus": "ok", "procesado": True, **PAGOS_PROCESADOS[payment_id]}, 200)
-                    return
-
-                pago_json = obtener_pago(payment_id)
-                pago = extraer_data_pago(pago_json)
-                respuesta(self, {"estatus": "ok", "procesado": False, "pago": pago}, 200)
+                res = procesar_pago(payment_id, referencia)
+                respuesta(self, {"estatus": "ok", **res}, 200)
                 return
 
             # Endpoints de imagen protegidos por licencia
-            if self.path in ("/api/procesar_rostro", "/api/editar_rasgos"):
+            if ruta in ("/api/procesar_rostro", "/api/editar_rasgos"):
                 if not licencia_autorizada(self, datos):
                     return
                 img = cargar_imagen(datos, "imagen_base64", "imagen", "imagen_procesada")
-                result = procesar_rostro(img, datos) if self.path.endswith("rostro") else editar_rasgos(img, datos)
+                result = procesar_rostro(img, datos) if ruta.endswith("rostro") else editar_rasgos(img, datos)
                 respuesta(
                     self,
                     {
