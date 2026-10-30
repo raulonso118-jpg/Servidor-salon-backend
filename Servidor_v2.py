@@ -17,7 +17,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from db_manager import init_db
 from validador_licencias import validar_licencia_completa, generar_licencia_real
-from pagos_mp import crear_preferencia, obtener_pago, extraer_data_pago
+from pagos_mp import crear_preferencia, obtener_pago, extraer_data_pago, buscar_pago_aprobado
 from pagos_db import init_pagos_db, obtener_pago_guardado, guardar_pago
 
 PORT = int(os.environ.get("PORT", 8080))
@@ -297,6 +297,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return
                 res = procesar_pago(payment_id, referencia)
                 respuesta(self, {"estatus": "ok", **res}, 200)
+                return
+
+            # La app consulta por su referencia (secreta y aleatoria) y recibe la licencia
+            if ruta == "/api/pagos/consultar":
+                referencia = str(datos.get("external_reference", "")).strip()
+                if not referencia.startswith("orden_"):
+                    respuesta(self, {"estatus": "error", "mensaje": "Referencia inválida"}, 400)
+                    return
+                payment_id = buscar_pago_aprobado(referencia)
+                if not payment_id:
+                    respuesta(self, {"estatus": "ok", "mensaje": "Tu pago aún no aparece aprobado. Intenta de nuevo en un minuto."}, 200)
+                    return
+                res = procesar_pago(payment_id, referencia)
+                respuesta(self, {"estatus": "ok", "licencia": res.get("licencia"), "plan": res.get("plan"), "dias": res.get("dias")}, 200)
                 return
 
             # Endpoints de imagen protegidos por licencia
