@@ -121,3 +121,18 @@ def extraer_data_pago(pago_json: dict):
         "dias": dias,
         "external_reference": external_reference,
     }
+
+
+def buscar_pago_aprobado(external_reference: str):
+    """Devuelve el id del pago aprobado de una orden, o None."""
+    token = _get_access_token()
+    r = requests.get(
+        "https://api.mercadopago.com/v1/payments/search",
+        headers={"Authorization": f"Bearer {token}"},
+        params={"external_reference": external_reference, "status": "approved", "limit": 1},
+        timeout=20,
+    )
+    if r.status_code >= 400:
+        raise ValueError(f"Error buscando pago MP: {r.status_code}")
+    resultados = r.json().get("results") or []
+    return str(resultados[0]["id"]) if resultados else None
