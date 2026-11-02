@@ -4,6 +4,7 @@ Genera, valida y verifica licencias contra la base de datos.
 """
 import os
 import hashlib
+import hmac
 import random
 import string
 from datetime import datetime, timedelta
@@ -34,6 +35,38 @@ def _calcular_hash(codigo, secret=SECRET_SEED):
     """Calcula hash SHA256 de una licencia."""
     texto = f"{codigo}:{secret}"
     return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+
+
+def _firma_habilitada():
+    """Las licencias firmadas solo se emiten si hay un secreto propio configurado."""
+    return SECRET_SEED not in ("", "CAMBIAR_EN_PRODUCCION")
+
+
+def _firmar(cuerpo):
+    return hmac.new(SECRET_SEED.encode("utf-8"), cuerpo.encode("utf-8"), hashlib.sha256).hexdigest()[:12].upper()
+
+
+def _validar_firmada(codigo):
+    """
+    Valida GEN-<YYYYMMDD expiración>-<RANDOM6>-<FIRMA12> sin consultar la BD.
+    Retorna None si el código no tiene formato firmado; si lo tiene, (ok, mensaje, días).
+    """
+    partes = codigo.split("-")
+    if len(partes) != 4 or not (len(partes[1]) == 8 and partes[1].isdigit()):
+        return None
+    if not _firma_habilitada():
+        return False, "Licencias firmadas no disponibles: falta LIC_SECRET_SEED", 0
+    cuerpo = "-".join(partes[:3])
+    if not hmac.compare_digest(_firmar(cuerpo), partes[3].upper()):
+        return False, "Licencia modificada o corrupta (firma no válida)", 0
+    try:
+        fecha_exp = datetime.strptime(partes[1], "%Y%m%d").date()
+    except ValueError:
+        return False, "Licencia inválida", 0
+    dias_restantes = (fecha_exp - datetime.now().date()).days
+    if dias_restantes < 0:
+        return False, f"Licencia expirada el {fecha_exp.isoformat()}", 0
+    return True, f"Licencia activa. Restan {dias_restantes} días.", dias_restantes
 
 
 def _fecha_hoy():
@@ -76,7 +109,12 @@ def generar_licencia_real(dias=30, email="cliente@salon.com", device_id=None):
     """
     fecha_inicio = _fecha_hoy()
     fecha_expiracion = _calcular_expiracion(dias)
-    codigo = f"GEN-{fecha_inicio}-{_generar_random_code(6)}"
+    firmada = _firma_habilitada()
+    if firmada:
+        cuerpo = f"GEN-{fecha_expiracion.replace('-', '')}-{_generar_random_code(6)}"
+        codigo = f"{cuerpo}-{_firmar(cuerpo)}"
+    else:
+        codigo = f"GEN-{fecha_inicio}-{_generar_random_code(6)}"
     hash_code = _calcular_hash(codigo)
 
     # Guardar en BD
@@ -89,7 +127,8 @@ def generar_licencia_real(dias=30, email="cliente@salon.com", device_id=None):
         device_id=device_id
     )
 
-    if guardada:
+    # Una licencia firmada es válida aunque la BD (SQLite efímera) falle o se pierda
+    if guardada or firmada:
         registrar_log("generar_licencia", f"Licencia creada: {codigo} para {email}")
         return {
             "codigo": codigo,
@@ -162,6 +201,18 @@ def validar_licencia_real(licencia_codigo, dispositivo=None, ip=None):
         registrar_validacion(licencia_codigo, dispositivo, "formato_invalido", ip)
         registrar_log("validacion_fallida", f"Formato inválido: {licencia_codigo}")
         return False, "Formato de licencia inválido. Debe comenzar con GEN-", 0
+
+    # Licencias firmadas: se validan sin depender de la BD
+    firmada = _validar_firmada(licencia_codigo)
+    if firmada is not None:
+        ok, mensaje, dias = firmada
+        resultado_bd = obtener_licencia(licencia_codigo)
+        if ok and resultado_bd and not resultado_bd[5]:
+            ok, mensaje, dias = False, "Esta licencia ha sido desactivada", 0
+        registrar_validacion(licencia_codigo, dispositivo, "valida" if ok else "firma_o_expirada", ip)
+        if not ok:
+            registrar_log("validacion_fallida", f"{mensaje}: {licencia_codigo}")
+        return ok, mensaje, dias
 
     # Tercero: obtener de BD
     resultado_bd = obtener_licencia(licencia_codigo)
