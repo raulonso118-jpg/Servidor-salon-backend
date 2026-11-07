@@ -6,7 +6,11 @@ import mercadopago
 PLANES = {
     "semanal": {"precio": 39.0, "dias": 7, "titulo": "Licencia Semanal NBO-A"},
     "mensual": {"precio": 119.0, "dias": 30, "titulo": "Licencia Mensual NBO-A"},
-    "anual": {"precio": 999.0, "dias": 365, "titulo": "Licencia Anual NBO-A"},
+    "semestral": {"precio": 804.0, "dias": 180, "titulo": "Licencia Semestral NBO-A"},
+}
+
+PLANES_HISTORICOS = {
+    "anual": {"dias": 365},
 }
 
 
@@ -29,7 +33,7 @@ def obtener_plan(plan: str):
         raise ValueError("No se envió plan")
     clave = plan.strip().lower()
     if clave not in PLANES:
-        raise ValueError("Plan inválido. Usa: semanal, mensual, anual")
+        raise ValueError("Plan inválido. Usa: semanal, mensual, semestral")
     return clave, PLANES[clave]
 
 
@@ -108,10 +112,11 @@ def extraer_data_pago(pago_json: dict):
     email = payer.get("email") or metadata.get("email")
     plan = (metadata.get("plan") or "").lower()
 
-    if plan not in PLANES:
+    if plan not in PLANES and plan not in PLANES_HISTORICOS:
         plan = "mensual"  # fallback seguro
 
-    dias = int(PLANES[plan]["dias"])
+    datos_plan = PLANES.get(plan, PLANES_HISTORICOS.get(plan))
+    dias = int(datos_plan["dias"])
 
     return {
         "payment_id": payment_id,
