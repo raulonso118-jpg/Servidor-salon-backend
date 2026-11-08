@@ -23,7 +23,7 @@ DURACIONES = {
     "prueba": 7,      # Prueba gratis
     "30": 30,         # Licencia 30 días
     "90": 90,         # Licencia 90 días
-    "365": 365        # Licencia anual
+    "180": 180        # Licencia semestral
 }
 
 # ==================== LICENCIA DE DESARROLLADOR ====================
@@ -48,7 +48,7 @@ PRECIOS = {
     "prueba": 0.00,      # Gratis
     "30": 9.99,          # $9.99 por 30 días
     "90": 24.99,         # $24.99 por 90 días
-    "365": 79.99         # $79.99 por 1 año
+    "180": 804.00        # $804 MXN por 6 meses
 }
 
 # ==================== SECURITY ====================
